@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useResume } from '../context/ResumeContext'
 import { useAuth } from '../context/AuthContext'
@@ -44,24 +44,27 @@ export default function JobMatch() {
   const [loading, setLoading] = useState(false)
   const [loadingMsg, setLoadingMsg] = useState('')
 
+  // Wake the Render free-tier server on mount so it's warm by the time user clicks Generate
+  useEffect(() => {
+    axios.get(`${SERVER_URL}/health`, { timeout: 60000 }).catch(() => {})
+  }, [])
+
   async function handleGenerate() {
     if (mode === 'url' && !jobUrl.trim()) { toast.error('Please enter a job listing URL.'); return }
     if (mode === 'text' && !jobText.trim()) { toast.error('Please paste the job description.'); return }
     if (!resumeData.personalInfo.name) { toast.error('Please complete your resume form first.'); navigate('/resume-form'); return }
 
     setLoading(true)
-    setLoadingMsg('Analyzing job listing...')
+    setLoadingMsg('Waking up the AI server (first request can take ~30s)...')
 
     try {
       let jobDescription = mode === 'text' ? jobText : jobUrl
       updateSection('jobDescription', jobDescription)
 
-      setLoadingMsg('Fetching job details...')
-      await new Promise((r) => setTimeout(r, 800))
-
       try {
         if (mode === 'url') {
-          const scrapeRes = await axios.post(`${SERVER_URL}/api/scrape`, { url: jobUrl }, { timeout: 8000 })
+          setLoadingMsg('Fetching job listing...')
+          const scrapeRes = await axios.post(`${SERVER_URL}/api/scrape`, { url: jobUrl }, { timeout: 30000 })
           jobDescription = scrapeRes.data.text
         }
 
@@ -70,22 +73,36 @@ export default function JobMatch() {
           resumeData,
           jobDescription,
           userId: currentUser?.uid,
-        }, { timeout: 30000 })
+        }, { timeout: 90000 })
 
         setGeneratedResume(aiRes.data.resume)
-      } catch {
-        // Server unavailable — use demo mode
-        setLoadingMsg('Building your resume (demo mode)...')
-        await new Promise((r) => setTimeout(r, 1200))
-        const mockResume = buildMockResume(resumeData, jobDescription)
-        setGeneratedResume(mockResume)
-        toast.success('Resume ready! (Demo mode — add API key for full AI generation)')
+        toast.success('Resume generated successfully!')
         navigate('/preview')
-        return
-      }
+      } catch (err) {
+        const status = err?.response?.status
+        const isTimeout = err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')
+        const isNetworkDown = err?.code === 'ERR_NETWORK' || (!err?.response && !isTimeout)
 
-      toast.success('Resume generated successfully!')
-      navigate('/preview')
+        if (isNetworkDown) {
+          setLoadingMsg('Server unreachable — using demo mode...')
+          await new Promise((r) => setTimeout(r, 800))
+          const mockResume = buildMockResume(resumeData, jobDescription)
+          setGeneratedResume(mockResume)
+          toast.success('Resume ready! (Offline demo mode)')
+          navigate('/preview')
+          return
+        }
+
+        if (isTimeout) {
+          toast.error('Server is taking too long. Please try again — it should be warm now.', { duration: 5000 })
+          return
+        }
+        if (status === 500) {
+          toast.error(err?.response?.data?.message || 'AI is busy. Please try again in a minute.', { duration: 5000 })
+          return
+        }
+        throw err
+      }
     } catch (err) {
       console.error(err)
       toast.error('Something went wrong. Please try again.')
